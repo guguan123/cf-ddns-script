@@ -4,6 +4,9 @@
 #include <curl/curl.h>
 #include <ctype.h>
 #include <cjson/cJSON.h>
+#include <unistd.h>
+#include <signal.h>
+#include <stdbool.h>
 
 // 用于保存 HTTP 响应数据的内存块
 struct MemoryStruct {
@@ -66,11 +69,221 @@ static char* json_escape(const char* str) {
 	return escaped;
 }
 
+// 获取当前公网 IPv4 地址
+static char* get_current_ip(CURL *curl, struct MemoryStruct *chunk) {
+	char* current_ip = NULL;
+	long http_code = 0;
+	CURLcode res;
+
+	curl_easy_setopt(curl, CURLOPT_URL, "https://www.cloudflare.com/cdn-cgi/trace");
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)chunk);
+	curl_easy_setopt(curl, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);   /* 强制 IPv4 */
+
+	res = curl_easy_perform(curl);
+	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+
+	if (res != CURLE_OK || http_code != 200) {
+		fprintf(stderr, "Trace fetch failed: %s (HTTP %ld)\n", curl_easy_strerror(res), http_code);
+		return NULL;
+	}
+
+	// 从返回文本中解析 ip= 行
+	char* ip_line = strstr(chunk->memory, "ip=");
+	if (ip_line) {
+		// 跳过 "ip="
+		current_ip = strdup(ip_line + 3);
+		char* nl = strchr(current_ip, '\n');
+		// 去掉换行
+		if (nl) *nl = 0;
+	}
+
+	// 重置 chunk
+	free(chunk->memory);
+	chunk->memory = malloc(1);
+	if (!chunk->memory) {
+		// 如果无法分配内存
+		fprintf(stderr, "Re-malloc failed in get_current_ip\n");
+	}
+	chunk->size = 0;
+
+	// 简单 IPv4 校验
+	if (!current_ip || !strchr(current_ip, '.')) {
+		fprintf(stderr, "Failed to get valid IP\n");
+		free(current_ip);
+		return NULL;
+	}
+
+	return current_ip;
+}
+
+// 获取 DNS 记录的 ID 和当前 IP
+static bool get_dns_record(const char* token, const char* zone_id, const char* record_name,
+                           CURL *curl, struct MemoryStruct *chunk, char** record_id, char** dns_ip) {
+	long http_code = 0;
+	CURLcode res;
+	struct curl_slist *headers = NULL;
+	char auth_header[256];
+
+	char* encoded_name = url_encode(record_name);
+	if (!encoded_name) {
+		fprintf(stderr, "URL encode failed\n");
+		return false;
+	}
+	char url[256];
+	snprintf(url, sizeof(url), "https://api.cloudflare.com/client/v4/zones/%s/dns_records?type=A&name=%s", zone_id, encoded_name);
+	free(encoded_name);
+
+	snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", token);
+	headers = curl_slist_append(headers, auth_header);
+	headers = curl_slist_append(headers, "Content-Type: application/json");
+
+	curl_easy_setopt(curl, CURLOPT_URL, url);
+	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)chunk);
+
+	res = curl_easy_perform(curl);
+	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+
+	// 清除 cURL 句柄内部的指针，避免悬空引用
+	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, NULL);
+	curl_slist_free_all(headers);
+
+	if (res != CURLE_OK || http_code != 200) {
+		fprintf(stderr, "DNS fetch failed: %s (HTTP %ld)\n", curl_easy_strerror(res), http_code);
+		return false;
+	}
+
+	// 使用 cJSON 解析返回内容
+	cJSON *root = cJSON_Parse(chunk->memory);
+
+	// 重置 chunk
+	free(chunk->memory);
+	chunk->memory = malloc(1);
+	if (!chunk->memory) {
+		// 如果无法分配内存
+		fprintf(stderr, "Re-malloc failed in get_current_ip\n");
+	}
+	chunk->size = 0;
+
+	// cJSON 解析内容失败
+	if (!root) {
+		fprintf(stderr, "JSON parse failed for DNS records\n");
+		return false;
+	}
+	cJSON *result = cJSON_GetObjectItem(root, "result");
+	if (!cJSON_IsArray(result) || cJSON_GetArraySize(result) == 0) {
+		fprintf(stderr, "No DNS record found\n");
+		cJSON_Delete(root);
+		return false;
+	}
+	cJSON *rec = cJSON_GetArrayItem(result, 0); /* 默认取第一条 */
+	cJSON *id_obj = cJSON_GetObjectItem(rec, "id");
+	cJSON *content_obj = cJSON_GetObjectItem(rec, "content");
+	*record_id = id_obj->valuestring ? strdup(id_obj->valuestring) : NULL;
+	*dns_ip = content_obj->valuestring ? strdup(content_obj->valuestring) : NULL;
+	cJSON_Delete(root);
+
+	if (!*record_id || !*dns_ip) {
+		fprintf(stderr, "Failed to parse record ID or content\n");
+		return false;
+	}
+
+	return true;
+}
+
+// 更新 DNS 记录
+static bool update_dns_record(const char* token, const char* zone_id, const char* record_name,
+                              const char* record_id, const char* new_ip,
+                              CURL *curl, struct MemoryStruct *chunk) {
+	long http_code = 0;
+	CURLcode res;
+	struct curl_slist *headers = NULL;
+	char auth_header[256];
+
+	char put_url[256];
+	snprintf(put_url, sizeof(put_url), "https://api.cloudflare.com/client/v4/zones/%s/dns_records/%s", zone_id, record_id);
+
+	char* escaped_name = json_escape(record_name);
+	if (!escaped_name) {
+		fprintf(stderr, "JSON escape failed\n");
+		return false;
+	}
+	char* escaped_ip = json_escape(new_ip);
+	if (!escaped_ip) {
+		fprintf(stderr, "JSON escape failed\n");
+		free(escaped_name);
+		return false;
+	}
+	char json_body[512];
+	snprintf(json_body, sizeof(json_body),
+			 "{\"type\":\"A\",\"name\":\"%s\",\"content\":\"%s\",\"ttl\":300,\"proxied\":false}",
+			 escaped_name, escaped_ip);
+	free(escaped_name);
+	free(escaped_ip);
+
+	snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", token);
+	headers = curl_slist_append(headers, auth_header);
+	headers = curl_slist_append(headers, "Content-Type: application/json");
+
+	curl_easy_setopt(curl, CURLOPT_URL, put_url);
+	curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body);
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)chunk);
+
+	res = curl_easy_perform(curl);
+	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+
+	// 清除 cURL 句柄内部的指针，避免悬空引用
+	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, NULL);
+	curl_slist_free_all(headers);
+
+	if (res != CURLE_OK || http_code != 200) {
+		fprintf(stderr, "Update failed: %s (HTTP %ld)\n", curl_easy_strerror(res), http_code);
+		return false;
+	}
+
+	// 再次用 cJSON 判断更新是否成功
+	cJSON *update_root = cJSON_Parse(chunk->memory);
+
+	// 重置 chunk
+	free(chunk->memory);
+	chunk->memory = malloc(1);
+	if (!chunk->memory) {
+		fprintf(stderr, "Re-malloc failed in get_current_ip\n");
+	}
+	chunk->size = 0;
+
+	if (!update_root) {
+		fprintf(stderr, "JSON parse failed for update response\n");
+		return false;
+	}
+	cJSON *success_obj = cJSON_GetObjectItem(update_root, "success");
+	bool success = (success_obj != NULL && cJSON_IsTrue(success_obj));
+	cJSON_Delete(update_root);
+
+	if (success) {
+		printf("DNS updated to %s (TTL 300)\n", new_ip);
+	} else {
+		fprintf(stderr, "Update API error: %s\n", chunk->memory);
+	}
+
+	return success;
+}
+
+// 信号处理：优雅退出
+static volatile bool running = true;
+static void signal_handler(int sig) {
+	(void)sig;
+	running = false;
+}
+
 int main(void) {
 	CURL *curl;
 	CURLcode res;
-	long http_code = 0;
-	int ret = 1;   /* 返回值：0 成功，1 失败 */
 	struct MemoryStruct chunk = { .memory = malloc(1), .size = 0 };
 	if (!chunk.memory) {
 		fprintf(stderr, "malloc() 失败\n");
@@ -91,8 +304,6 @@ int main(void) {
 	}
 
 	curl_global_init(CURL_GLOBAL_ALL);
-
-	// 步骤 1：通过 Cloudflare trace 接口获取当前公网 IPv4
 	curl = curl_easy_init();
 	if (!curl) {
 		fprintf(stderr, "curl_easy_init() failed\n");
@@ -101,191 +312,59 @@ int main(void) {
 		return 1;
 	}
 
-	curl_easy_setopt(curl, CURLOPT_URL, "https://www.cloudflare.com/cdn-cgi/trace");
-	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-	curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
-	curl_easy_setopt(curl, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);   /* 强制 IPv4 */
+	// 注册信号处理
+	signal(SIGINT, signal_handler);
+	signal(SIGTERM, signal_handler);
 
-	res = curl_easy_perform(curl);
-	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-	curl_easy_cleanup(curl);
-	if (res != CURLE_OK || http_code != 200) {
-		fprintf(stderr, "Trace fetch failed: %s (HTTP %ld)\n", curl_easy_strerror(res), http_code);
-		curl_global_cleanup();
-		free(chunk.memory);
-		return 1;
-	}
-
-	// 从返回文本中解析 ip= 行
-	char* current_ip = NULL;
-	char* ip_line = strstr(chunk.memory, "ip=");
-	if (ip_line) {
-		// 跳过 "ip="
-		current_ip = strdup(ip_line + 3);
-		char* nl = strchr(current_ip, '\n');
-		// 去掉换行
-		if (nl) *nl = 0;
-	}
-	// 重置 chunk，供后续请求复用
-	free(chunk.memory);
-	chunk.memory = malloc(1);
-	chunk.size = 0;
-
-	// 简单 IPv4 校验
-	if (!current_ip || !strchr(current_ip, '.')) {
-		fprintf(stderr, "Failed to get valid IP\n");
+	// 初始获取 DNS 当前 IP
+	char *record_id = NULL;
+	char *last_ip = NULL;
+	if (!get_dns_record(token, zone_id, record_name, curl, &chunk, &record_id, &last_ip)) {
+		fprintf(stderr, "Initial DNS fetch failed\n");
 		goto cleanup;
 	}
-	printf("Current IP: %s\n", current_ip);
+	printf("Initial DNS IP: %s\n", last_ip);
 
-	// 步骤 2：获取指定域名的 DNS 记录 ID 及当前解析值
-	curl = curl_easy_init();
-	if (!curl) {
-		fprintf(stderr, "curl_easy_init() failed\n");
-		goto cleanup;
+	printf("Starting DDNS monitor loop (check every 5 minutes). Press Ctrl+C to stop.\n");
+
+	// 主循环：每 300 秒检查一次 IP 变化
+	while (running) {
+		char *current_ip = get_current_ip(curl, &chunk);
+		if (!current_ip) {
+			fprintf(stderr, "Failed to get current IP, skipping...\n");
+			sleep(300);
+			continue;
+		}
+
+		printf("Current IP: %s\n", current_ip);
+
+		// 判断是否需要更新
+		if (strcmp(current_ip, last_ip) != 0) {
+			printf("IP changed from %s to %s. Updating DNS...\n", last_ip, current_ip);
+			if (update_dns_record(token, zone_id, record_name, record_id, current_ip, curl, &chunk)) {
+				free(last_ip);
+				last_ip = current_ip;
+				current_ip = NULL; // 立即置空指针，防止双重释放
+			} else {
+				fprintf(stderr, "Update failed, keeping old IP.\n");
+				free(current_ip);
+				current_ip = NULL; // 置空指针
+			}
+		} else {
+			printf("IP unchanged. No update needed.\n");
+			free(current_ip);
+		}
+
+		sleep(300);  // 5 分钟检查一次
 	}
 
-	char* encoded_name = url_encode(record_name);
-	if (!encoded_name) {
-		fprintf(stderr, "URL encode failed\n");
-		curl_easy_cleanup(curl);
-		goto cleanup;
-	}
-	char url[256];
-	snprintf(url, sizeof(url), "https://api.cloudflare.com/client/v4/zones/%s/dns_records?type=A&name=%s", zone_id, encoded_name);
-	free(encoded_name);
-
-	struct curl_slist *headers = NULL;
-	char auth_header[256];
-	snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", token);
-	headers = curl_slist_append(headers, auth_header);
-	headers = curl_slist_append(headers, "Content-Type: application/json");
-
-	curl_easy_setopt(curl, CURLOPT_URL, url);
-	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-	curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
-
-	res = curl_easy_perform(curl);
-	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-	curl_slist_free_all(headers);
-	curl_easy_cleanup(curl);
-	if (res != CURLE_OK || http_code != 200) {
-		fprintf(stderr, "DNS fetch failed: %s (HTTP %ld)\n", curl_easy_strerror(res), http_code);
-		goto cleanup;
-	}
-
-	// 使用 cJSON 解析返回内容
-	cJSON *root = cJSON_Parse(chunk.memory);
-	if (!root) {
-		fprintf(stderr, "JSON parse failed for DNS records\n");
-		goto cleanup;
-	}
-	cJSON *result = cJSON_GetObjectItem(root, "result");
-	if (!cJSON_IsArray(result) || cJSON_GetArraySize(result) == 0) {
-		fprintf(stderr, "No DNS record found\n");
-		cJSON_Delete(root);
-		goto cleanup;
-	}
-	cJSON *rec = cJSON_GetArrayItem(result, 0); /* 默认取第一条 */
-	cJSON *id_obj = cJSON_GetObjectItem(rec, "id");
-	cJSON *content_obj = cJSON_GetObjectItem(rec, "content");
-	char* record_id = id_obj->valuestring ? strdup(id_obj->valuestring) : NULL;
-	char* dns_ip = content_obj->valuestring ? strdup(content_obj->valuestring) : NULL;
-	cJSON_Delete(root);
-
-	if (!record_id || !dns_ip) {
-		fprintf(stderr, "Failed to parse record ID or content\n");
-		goto cleanup;
-	}
-	printf("DNS Record ID: %s\n", record_id);
-	printf("Current DNS IP: %s\n", dns_ip);
-
-	// 步骤 3：判断是否需要更新
-	if (strcmp(current_ip, dns_ip) == 0) {
-		printf("IP unchanged. No update needed.\n");
-		free(record_id);
-		free(dns_ip);
-		ret = 0; /* 同样视为成功 */
-		goto cleanup;
-	}
-	free(dns_ip);
-
-	// 重置 chunk，供步骤 4 复用
-	free(chunk.memory);
-	chunk.memory = malloc(1);
-	chunk.size = 0;
-
-	// 步骤 4：调用 Cloudflare API 更新 DNS 记录
-	curl = curl_easy_init();
-	if (!curl) {
-		fprintf(stderr, "curl_easy_init() failed\n");
-		free(record_id);
-		goto cleanup;
-	}
-
-	char put_url[256];
-	snprintf(put_url, sizeof(put_url), "https://api.cloudflare.com/client/v4/zones/%s/dns_records/%s", zone_id, record_id);
-	free(record_id); /* 后续不再需要 */
-
-	char* escaped_name = json_escape(record_name);
-	if (!escaped_name) {
-		fprintf(stderr, "JSON escape failed\n");
-		curl_easy_cleanup(curl);
-		goto cleanup;
-	}
-	char* escaped_ip = json_escape(current_ip);
-	if (!escaped_ip) {
-		fprintf(stderr, "JSON escape failed\n");
-		free(escaped_name);
-		curl_easy_cleanup(curl);
-		goto cleanup;
-	}
-	char json_body[512];
-	snprintf(json_body, sizeof(json_body),
-			 "{\"type\":\"A\",\"name\":\"%s\",\"content\":\"%s\",\"ttl\":300,\"proxied\":false}",
-			 escaped_name, escaped_ip);
-	free(escaped_name);
-	free(escaped_ip);
-
-	headers = NULL;
-	headers = curl_slist_append(headers, auth_header);
-	headers = curl_slist_append(headers, "Content-Type: application/json");
-
-	curl_easy_setopt(curl, CURLOPT_URL, put_url);
-	curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
-	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body);
-	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-	curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
-
-	res = curl_easy_perform(curl);
-	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-	curl_slist_free_all(headers);
-	curl_easy_cleanup(curl);
-	if (res != CURLE_OK || http_code != 200) {
-		fprintf(stderr, "Update failed: %s (HTTP %ld)\n", curl_easy_strerror(res), http_code);
-		goto cleanup;
-	}
-
-	// 再次用 cJSON 判断更新是否成功
-	cJSON *update_root = cJSON_Parse(chunk.memory);
-	if (!update_root) {
-		fprintf(stderr, "JSON parse failed for update response\n");
-		goto cleanup;
-	}
-	cJSON *success_obj = cJSON_GetObjectItem(update_root, "success");
-	if (success_obj != NULL && cJSON_IsTrue(success_obj)) {
-		printf("DNS updated to %s (TTL 300)\n", current_ip);
-		ret = 0; /* 标记为成功 */
-	} else {
-		fprintf(stderr, "Update API error: %s\n", chunk.memory);
-	}
-	cJSON_Delete(update_root);
+	printf("Shutting down DDNS monitor.\n");
 
 cleanup:
-	free(current_ip);
+	free(record_id);
+	free(last_ip);
 	free(chunk.memory);
+	curl_easy_cleanup(curl);
 	curl_global_cleanup();
-	return ret;
+	return 0;
 }
