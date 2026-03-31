@@ -16,7 +16,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <curl/curl.h>
-#include <ctype.h>
 #include <cjson/cJSON.h>
 #include <unistd.h>
 #include <signal.h>
@@ -32,7 +31,6 @@ struct MemoryStruct {
 static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp) {
 	size_t realsize = size * nmemb;
 	struct MemoryStruct *mem = (struct MemoryStruct *)userp;
-
 	char *ptr = realloc(mem->memory, mem->size + realsize + 1);
 	if (!ptr) {
 		fprintf(stderr, "realloc() failed\n");
@@ -43,35 +41,6 @@ static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, voi
 	mem->size += realsize;
 	mem->memory[mem->size] = 0;
 	return realsize;
-}
-
-// 简易 URL 编码：仅针对域名或 IP 等基本字符
-static char* url_encode(const char* str) {
-	char *encoded = malloc(strlen(str) * 3 + 1), *p = encoded;
-	if (!encoded) return NULL;
-	for (; *str; ++str) {
-		if (isalnum(*str) || *str == '-' || *str == '_' || *str == '.' || *str == '~')
-			*p++ = *str;
-		else {
-			sprintf(p, "%%%02X", (unsigned char)*str);
-			p += 3;
-		}
-	}
-	*p = 0;
-	return encoded;
-}
-
-// 简易 JSON 字符串转义：仅处理双引号与反斜杠
-static char* json_escape(const char* str) {
-	size_t len = strlen(str);
-	char *escaped = malloc(len * 2 + 1), *p = escaped;
-	if (!escaped) return NULL;
-	for (; *str; ++str) {
-		if (*str == '"' || *str == '\\') { *p++ = '\\'; }
-		*p++ = *str;
-	}
-	*p = 0;
-	return escaped;
 }
 
 // 获取当前公网 IP
@@ -100,10 +69,8 @@ static char* get_ip(CURL *curl, struct MemoryStruct *chunk, int family) {
 	char *nl = strchr(ip, '\n');
 	if (nl) *nl = 0;
 
-	/* 重置 chunk */
-	free(chunk->memory);
-	chunk->memory = malloc(1);
-	chunk->size = 0;
+	// 重置 chunk
+	free(chunk->memory); chunk->memory = malloc(1); chunk->size = 0;
 
 	return ip;
 }
@@ -120,21 +87,21 @@ static void free_dns_record(DNSRecord *r) {
 	r->id = r->content = NULL;
 }
 
-/* 获取单条 DNS 记录（A 或 AAAA） */
+// 获取 DNS 记录
 static bool fetch_dns_record(const char *token, const char *zone_id,
 							 const char *type, const char *name,
 							 CURL *curl, struct MemoryStruct *chunk,
 							 DNSRecord *rec) {
 	memset(rec, 0, sizeof(*rec));
 
-	char *enc_name = url_encode(name);
+	char *enc_name = curl_easy_escape(curl, name, 0);
 	if (!enc_name) return false;
 
 	char url[512];
 	snprintf(url, sizeof(url),
 			 "https://api.cloudflare.com/client/v4/zones/%s/dns_records?type=%s&name=%s",
 			 zone_id, type, enc_name);
-	free(enc_name);
+	curl_free(enc_name);
 
 	struct curl_slist *headers = NULL;
 	char auth[256];
@@ -144,6 +111,7 @@ static bool fetch_dns_record(const char *token, const char *zone_id,
 
 	curl_easy_setopt(curl, CURLOPT_URL, url);
 	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+	curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "GET");
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, chunk);
 
@@ -151,7 +119,6 @@ static bool fetch_dns_record(const char *token, const char *zone_id,
 	long http_code = 0;
 	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
 
-	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, NULL);
 	curl_slist_free_all(headers);
 
 	if (res != CURLE_OK || http_code != 200) {
@@ -191,7 +158,7 @@ static bool fetch_dns_record(const char *token, const char *zone_id,
 	return true;
 }
 
-/* 更新单条 DNS 记录 */
+// 更新 DNS 记录
 static bool update_dns_record(const char *token, const char *zone_id,
 							  const char *type, const char *name,
 							  const char *record_id, const char *new_ip,
@@ -201,18 +168,14 @@ static bool update_dns_record(const char *token, const char *zone_id,
 			 "https://api.cloudflare.com/client/v4/zones/%s/dns_records/%s",
 			 zone_id, record_id);
 
-	char *esc_name = json_escape(name);
-	char *esc_ip   = json_escape(new_ip);
-	if (!esc_name || !esc_ip) {
-		free(esc_name); free(esc_ip);
-		return false;
-	}
-
-	char body[1024];
-	snprintf(body, sizeof(body),
-			 "{\"type\":\"%s\",\"name\":\"%s\",\"content\":\"%s\",\"ttl\":300,\"proxied\":false}",
-			 type, esc_name, esc_ip);
-	free(esc_name); free(esc_ip);
+	// 使用 cJSON 构建结构化的 JSON 数据
+	cJSON *root = cJSON_CreateObject();
+	cJSON_AddStringToObject(root, "type", type);
+	cJSON_AddStringToObject(root, "name", name);
+	cJSON_AddStringToObject(root, "content", new_ip);
+	cJSON_AddNumberToObject(root, "ttl", 300);
+	cJSON_AddBoolToObject(root, "proxied", false);
+	char *json_body = cJSON_PrintUnformatted(root);
 
 	struct curl_slist *headers = NULL;
 	char auth[256];
@@ -223,7 +186,7 @@ static bool update_dns_record(const char *token, const char *zone_id,
 	curl_easy_setopt(curl, CURLOPT_URL, url);
 	curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
 	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body);
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, chunk);
 
@@ -231,7 +194,7 @@ static bool update_dns_record(const char *token, const char *zone_id,
 	long http_code = 0;
 	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
 
-	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, NULL);
+	free(json_body);
 	curl_slist_free_all(headers);
 
 	if (res != CURLE_OK || http_code != 200) {
